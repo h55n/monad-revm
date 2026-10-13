@@ -194,10 +194,10 @@ where
             effective_gas_price
         };
 
-        let reward = coinbase_gas_price * gas_limit as u128;
+        let reward = U256::from(coinbase_gas_price) * U256::from(gas_limit);
         let beneficiary = ctx.block().beneficiary();
 
-        ctx.journal_mut().balance_incr(beneficiary, U256::from(reward))?;
+        ctx.journal_mut().balance_incr(beneficiary, reward)?;
 
         Ok(())
     }
@@ -473,6 +473,57 @@ mod tests {
             coinbase_balance, expected_reward,
             "Coinbase should receive gas_limit * gas_price = {expected_reward}, got {coinbase_balance}"
         );
+    }
+
+    #[test]
+    fn test_reward_beneficiary_does_not_overflow_u128() {
+        let caller = Address::from([1u8; 20]);
+        let coinbase = Address::from([2u8; 20]);
+        let gas_limit = 21_000u64;
+        let gas_price = u128::MAX;
+
+        // Run the overflow case with and without a base fee: the sender is
+        // charged the full gas price, the beneficiary gets the part above the
+        // base fee, and the base fee part is burned.
+        for basefee in [0u64, 7u64] {
+            let mut db = InMemoryDB::default();
+            db.insert_account_info(
+                caller,
+                revm::state::AccountInfo { balance: U256::MAX, ..Default::default() },
+            );
+            db.insert_account_info(coinbase, revm::state::AccountInfo::default());
+
+            let ctx = monad_context_with_db(db);
+            let mut evm = ctx.build_monad_with_inspector(NoOpInspector {});
+            evm.ctx().block.beneficiary = coinbase;
+            evm.ctx().block.basefee = basefee;
+
+            let tx = TxEnv::builder()
+                .caller(caller)
+                .to(Address::from([3u8; 20]))
+                .gas_limit(gas_limit)
+                .gas_price(gas_price)
+                .build_fill();
+
+            let result = evm.transact(tx).expect("Transaction should succeed");
+
+            let caller_balance =
+                result.state.get(&caller).map(|a| a.info.balance).unwrap_or_default();
+            let coinbase_balance =
+                result.state.get(&coinbase).map(|a| a.info.balance).unwrap_or_default();
+
+            let gas_limit = U256::from(gas_limit);
+            assert_eq!(
+                caller_balance,
+                U256::MAX - U256::from(gas_price) * gas_limit,
+                "sender debit with basefee {basefee}"
+            );
+            assert_eq!(
+                coinbase_balance,
+                U256::from(gas_price - basefee as u128) * gas_limit,
+                "beneficiary credit with basefee {basefee}"
+            );
+        }
     }
 
     #[test]
